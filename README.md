@@ -6,7 +6,6 @@ Root-only commands for this DirectAdmin host. Both mail through the msmtp accoun
 | --- | --- |
 | `da-hits` | Monthly web-hit digest from Webalizer (AWStats if that data is present) |
 | `da-load` | Load, hot files, today's access logs, mail logs, OpenLiteSpeed |
-| `da-load-mail` | Same report as `da-load`, emailed and quiet. Symlink to `da-load`. |
 
 ## da-hits
 
@@ -71,20 +70,6 @@ A site is flagged when month-to-date hits are at least 100,000 and at least trip
 | `-q`, `--quiet` | No stdout |
 
 `lswsctrl status` can report "not running" while workers are up, because it looks for a pid file. The process list in the report is the check to trust. The server-wide OpenLiteSpeed access log is usually empty; per-domain hits are in `/var/log/httpd/domains/`.
-
-## da-load-mail
-
-Emails the full `da-load` report to the default recipient and prints nothing. Pass `-e` to send somewhere else. A section name limits the body the same way as `da-load`.
-
-```bash
-da-load-mail
-da-load-mail mail
-da-load-mail -e ops@example.com
-```
-
-Override the default recipient for one run with `DEFAULT_EMAIL=you@example.com da-load-mail`.
-
-Cron (`/etc/cron.d/da-load`), daily at 01:40:
 
 ```bash
 /root/bin/da-load-mail
