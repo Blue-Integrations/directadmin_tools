@@ -3,13 +3,15 @@
 # da-load-mail — same report, emailed (quiet) like da-hits
 #
 #   da-load
-#   da-load mail|lsws|hits|load
+#   da-load mail|lsws|hits|load|topbyip
 #   da-load hits -d example.com
+#   da-load topbyip
 #   da-load-mail
 
 set -euo pipefail
 
 LINES=12
+IP_CAP=0
 THRESHOLD=100000
 QUIET=0
 FILTER_DOMAIN=""
@@ -43,10 +45,13 @@ Sections (default: all):
   mail                  Exim queue, panic log, mail.log
   lsws                  OpenLiteSpeed status and error log
                         (aliases: lightspeed, ols)
+  topbyip               Requests per client IP, one domain log at a time
+                        Not included in the default snapshot
 
 Options:
   -d, --domain DOMAIN   Limit hits/access logs to one domain
-  -n, --lines N         Sample depth (default: 12)
+  -n, --lines N         Sample depth (default: 12). For topbyip, caps
+                        IPs listed per domain; omit it to list every IP
   -t, --threshold N     Flag a URL or spiked site at N hits (default: 100000)
   -e, --email ADDR      Email the report (comma-separated or repeatable)
   -s, --subject TEXT    Override email subject
@@ -61,6 +66,8 @@ Examples:
   da-load mail
   da-load lsws
   da-load hits -d example.com
+  da-load topbyip
+  da-load topbyip -d example.com -n 20
   da-load-mail
   da-load -e ops@example.com
 EOF
@@ -87,10 +94,10 @@ append_emails() {
 SECTIONS=()
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-		load|hits|mail) SECTIONS+=("$1"); shift ;;
+		load|hits|mail|topbyip) SECTIONS+=("$1"); shift ;;
 		lsws|lightspeed|ols) SECTIONS+=("lsws"); shift ;;
 		-d|--domain) FILTER_DOMAIN="${2:-}"; [[ -n "$FILTER_DOMAIN" ]] || die "$1 requires a domain"; shift 2 ;;
-		-n|--lines) LINES="${2:-}"; shift 2 ;;
+		-n|--lines) LINES="${2:-}"; IP_CAP="${2:-}"; shift 2 ;;
 		-t|--threshold) THRESHOLD="${2:-}"; shift 2 ;;
 		-e|--email)
 			[[ -n "${2:-}" ]] || die "$1 requires an address"
@@ -125,15 +132,16 @@ fi
 REPORT_FILE=$(mktemp)
 trap 'rm -f "$REPORT_FILE"' EXIT
 
-python3 - "$SECTION_ARG" "$FILTER_DOMAIN" "$LINES" "$THRESHOLD" >"$REPORT_FILE" <<'PY'
+python3 - "$SECTION_ARG" "$FILTER_DOMAIN" "$LINES" "$THRESHOLD" "$IP_CAP" >"$REPORT_FILE" <<'PY'
 import os, re, sys, subprocess
 from collections import Counter
 from datetime import datetime
 
-sections_arg, domain_filter, lines_s, threshold_s = sys.argv[1:]
+sections_arg, domain_filter, lines_s, threshold_s, ip_cap_s = sys.argv[1:]
 want = set(sections_arg.split(",")) if sections_arg != "all" else {"load", "hits", "mail", "lsws"}
 lines_n = int(lines_s)
 threshold = int(threshold_s)
+ip_cap = int(ip_cap_s or "0")
 
 HTTPD_DOMAINS = "/var/log/httpd/domains"
 EXIM_MAIN = "/var/log/exim/mainlog"
@@ -248,20 +256,21 @@ def scan_access(path):
     text = read_text(path, limit_bytes=20_000_000)
     if text is None:
         return None
-    paths, statuses, watched = Counter(), Counter(), Counter()
+    paths, statuses, watched, ips = Counter(), Counter(), Counter(), Counter()
     total = 0
     for line in text.splitlines():
         m = REQ_RE.match(line)
         if not m:
             continue
         total += 1
-        url, status = m.group(3), m.group(4)
+        ip, url, status = m.group(1), m.group(3), m.group(4)
         path_only = url.split("?", 1)[0] or "/"
         paths[path_only] += 1
         statuses[status] += 1
+        ips[ip] += 1
         if WATCH_RE.search(path_only):
             watched[path_only] += 1
-    return {"total": total, "paths": paths, "statuses": statuses, "watched": watched}
+    return {"total": total, "paths": paths, "statuses": statuses, "watched": watched, "ips": ips}
 
 # ---------- collect ----------
 load1 = load5 = load15 = 0.0
@@ -299,7 +308,7 @@ if "hits" in want:
         })
 
 access_rows = []
-if "hits" in want and os.path.isdir(HTTPD_DOMAINS):
+if ("hits" in want or "topbyip" in want) and os.path.isdir(HTTPD_DOMAINS):
     for name in sorted(os.listdir(HTTPD_DOMAINS)):
         if not name.endswith(".log") or name.endswith(".error.log"):
             continue
@@ -531,6 +540,22 @@ if "hits" in want:
             add(f"    {n:>6}  {domain} {path_s}")
     elif access_rows:
         add("  Watched paths: none in today's logs")
+    add()
+
+if "topbyip" in want:
+    add("TOP BY IP  (each vhost access log, current file)")
+    if not access_rows:
+        add("  no access logs matched")
+    for domain, scanned in sorted(access_rows, key=lambda r: (-r[1]["total"], r[0])):
+        ips = scanned["ips"]
+        add(f"  {domain:<28} {scanned['total']:>6} req   {len(ips)} ips")
+        ranked = ips.most_common(ip_cap if ip_cap > 0 else None)
+        for ip, n in ranked:
+            pct = (n * 100 / scanned["total"]) if scanned["total"] else 0
+            add(f"    {n:>7}  {pct:5.1f}%  {ip}")
+        hidden = len(ips) - len(ranked)
+        if hidden > 0:
+            add(f"    {hidden} more ips")
     add()
 
 if "mail" in want:
