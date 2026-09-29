@@ -1,6 +1,6 @@
 # /root/bin
 
-Root-only commands for this DirectAdmin host (`web01`). Both mail through the msmtp account in `/root/.config/da-hits/msmtprc` (From: `dahits@blueintegrations.com`). Run them as root.
+Root-only commands for this DirectAdmin host. Both mail through the msmtp account in `/root/.config/da-hits/msmtprc`. Run them as root.
 
 | Command | What it does |
 | --- | --- |
@@ -14,9 +14,9 @@ Current month plus a short lookback. Stats come from `~/domains/*/stats/`.
 
 ```bash
 da-hits
-da-hits -d sucheckicontracting.com
-da-hits -d sucheckicontracting.com -e taylor@sucheckicontracting.com -q
-da-hits -u alemstrom -m 3 -v
+da-hits -d example.com
+da-hits -d example.com -e ops@example.com -q
+da-hits -u someuser -m 3 -v
 da-hits --json
 ```
 
@@ -31,11 +31,11 @@ da-hits --json
 | `-v`, `--verbose` | Per-domain rows for each history month |
 | `--json` | Machine-readable output. Cannot be combined with `--email` |
 
-Cron (`/etc/cron.d/da-hits`), daily at 01:25 after the DirectAdmin tally at 00:10:
+Cron (`/etc/cron.d/da-hits`), daily at 01:25 after the DirectAdmin tally at 00:10. One quiet email per domain, for example:
 
-- sucheckicontracting.com → taylor@sucheckicontracting.com
-- blueintegrations.com → andrew@blueintegrations.com
-- excessivesounds.com → info@excessivesounds.com
+- example.com → ops@example.com
+- exampleb.com → ops@exampleb.com
+- examplec.com → ops@examplec.com
 
 ## da-load
 
@@ -44,10 +44,10 @@ One snapshot of the host. With no section, it prints all of them.
 ```bash
 da-load
 da-load load
-da-load hits -d sucheckicontracting.com
+da-load hits -d example.com
 da-load mail
 da-load lsws
-da-load -e andrew@blueintegrations.com
+da-load -e ops@example.com
 ```
 
 Sections: `load`, `hits`, `mail`, `lsws`. `lightspeed` and `ols` are aliases for `lsws`.
@@ -74,12 +74,12 @@ A site is flagged when month-to-date hits are at least 100,000 and at least trip
 
 ## da-load-mail
 
-Emails the full `da-load` report to `andrew@blueintegrations.com` and prints nothing. Pass `-e` to send somewhere else. A section name limits the body the same way as `da-load`.
+Emails the full `da-load` report to the default recipient and prints nothing. Pass `-e` to send somewhere else. A section name limits the body the same way as `da-load`.
 
 ```bash
 da-load-mail
 da-load-mail mail
-da-load-mail -e someone@example.com
+da-load-mail -e ops@example.com
 ```
 
 Override the default recipient for one run with `DEFAULT_EMAIL=you@example.com da-load-mail`.

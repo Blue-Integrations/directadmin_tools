@@ -4,7 +4,7 @@
 #
 #   da-load
 #   da-load mail|lsws|hits|load
-#   da-load hits -d sucheckicontracting.com
+#   da-load hits -d example.com
 #   da-load-mail
 
 set -euo pipefail
@@ -53,16 +53,16 @@ Options:
   -q, --quiet           Suppress stdout (for cron / da-load-mail)
   -h, --help            Show this help
 
-da-load-mail emails andrew@blueintegrations.com and stays quiet.
+da-load-mail emails the default recipient and stays quiet.
 Outbound mail uses the same msmtp account as da-hits.
 
 Examples:
   da-load
   da-load mail
   da-load lsws
-  da-load hits -d sucheckicontracting.com
+  da-load hits -d example.com
   da-load-mail
-  da-load -e andrew@blueintegrations.com
+  da-load -e ops@example.com
 EOF
 }
 

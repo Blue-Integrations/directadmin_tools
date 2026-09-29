@@ -35,7 +35,7 @@ Options:
   -q, --quiet           Suppress stdout (useful with --email / cron)
                         Outbound mail uses SMTP via msmtp when
                         /root/.config/da-hits/msmtprc exists
-                        (From: dahits@blueintegrations.com).
+                        (From: the address in that msmtp config).
   -v, --verbose         Per-domain rows for every history month
   --json                Machine-readable output (not with --email)
   -h, --help            Show this help
@@ -44,8 +44,8 @@ Reads Webalizer history under ~/domains/*/stats/ (this server).
 If AWStats data appears under ~/domains/*/awstats/, that is used instead.
 
 Examples:
-  da-hits -d sucheckicontracting.com
-  da-hits -d sucheckicontracting.com -e taylor@sucheckicontracting.com -q
+  da-hits -d example.com
+  da-hits -d example.com -e ops@example.com -q
 EOF
 }
 
