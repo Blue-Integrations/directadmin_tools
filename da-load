@@ -1,0 +1,653 @@
+#!/usr/bin/env bash
+# da-load — server load, hot-file, mail, and OpenLiteSpeed snapshot
+# da-load-mail — same report, emailed (quiet) like da-hits
+#
+#   da-load
+#   da-load mail|lsws|hits|load
+#   da-load hits -d sucheckicontracting.com
+#   da-load-mail
+
+set -euo pipefail
+
+LINES=12
+THRESHOLD=100000
+QUIET=0
+FILTER_DOMAIN=""
+EMAIL_TO=""
+EMAIL_SUBJECT=""
+FORCE_MAIL=0
+
+DEFAULT_EMAIL="${DEFAULT_EMAIL:-andrew@blueintegrations.com}"
+SENDMAIL=${SENDMAIL:-/usr/sbin/sendmail}
+MSMTP_BIN=${MSMTP_BIN:-/usr/bin/msmtp}
+MSMTP_CONFIG=${MSMTP_CONFIG:-/root/.config/da-hits/msmtprc}
+MAIL_FROM="${MAIL_FROM:-dahits@blueintegrations.com}"
+
+INV=$(basename "$0")
+if [[ "$INV" == "da-load-mail" ]]; then
+	FORCE_MAIL=1
+	QUIET=1
+fi
+
+usage() {
+	cat <<'EOF'
+Usage: da-load [section ...] [options]
+       da-load-mail [section ...] [options]
+
+Snapshot of this host: load, Webalizer hot files (monthly hit spikes),
+today's vhost access logs, Exim/Dovecot mail logs, and OpenLiteSpeed.
+
+Sections (default: all):
+  load                  CPU, memory, disk, top processes
+  hits                  Monthly hot files + today's access logs
+  mail                  Exim queue, panic log, mail.log
+  lsws                  OpenLiteSpeed status and error log
+                        (aliases: lightspeed, ols)
+
+Options:
+  -d, --domain DOMAIN   Limit hits/access logs to one domain
+  -n, --lines N         Sample depth (default: 12)
+  -t, --threshold N     Flag a URL or spiked site at N hits (default: 100000)
+  -e, --email ADDR      Email the report (comma-separated or repeatable)
+  -s, --subject TEXT    Override email subject
+  -q, --quiet           Suppress stdout (for cron / da-load-mail)
+  -h, --help            Show this help
+
+da-load-mail emails andrew@blueintegrations.com and stays quiet.
+Outbound mail uses the same msmtp account as da-hits.
+
+Examples:
+  da-load
+  da-load mail
+  da-load lsws
+  da-load hits -d sucheckicontracting.com
+  da-load-mail
+  da-load -e andrew@blueintegrations.com
+EOF
+}
+
+die() { echo "da-load: $*" >&2; exit 1; }
+
+append_emails() {
+	local raw=$1 addr
+	IFS=',' read -ra _addrs <<<"$raw"
+	for addr in "${_addrs[@]}"; do
+		addr=$(echo "$addr" | tr -d '[:space:]')
+		[[ -z "$addr" ]] && continue
+		[[ "$addr" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] \
+			|| die "invalid email address: $addr"
+		if [[ -n "$EMAIL_TO" ]]; then
+			EMAIL_TO+=",$addr"
+		else
+			EMAIL_TO="$addr"
+		fi
+	done
+}
+
+SECTIONS=()
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		load|hits|mail) SECTIONS+=("$1"); shift ;;
+		lsws|lightspeed|ols) SECTIONS+=("lsws"); shift ;;
+		-d|--domain) FILTER_DOMAIN="${2:-}"; [[ -n "$FILTER_DOMAIN" ]] || die "$1 requires a domain"; shift 2 ;;
+		-n|--lines) LINES="${2:-}"; shift 2 ;;
+		-t|--threshold) THRESHOLD="${2:-}"; shift 2 ;;
+		-e|--email)
+			[[ -n "${2:-}" ]] || die "$1 requires an address"
+			append_emails "$2"
+			shift 2
+			;;
+		-s|--subject) EMAIL_SUBJECT="${2:-}"; shift 2 ;;
+		-q|--quiet) QUIET=1; shift ;;
+		-h|--help) usage; exit 0 ;;
+		*) die "unknown option: $1 (try --help)" ;;
+	esac
+done
+
+[[ "$LINES" =~ ^[0-9]+$ ]] && (( LINES >= 1 && LINES <= 200 )) \
+	|| die "--lines must be 1..200"
+[[ "$THRESHOLD" =~ ^[0-9]+$ ]] && (( THRESHOLD >= 1 )) \
+	|| die "--threshold must be a positive integer"
+[[ "$FILTER_DOMAIN" == */* ]] && die "--domain must be a bare domain"
+
+if (( FORCE_MAIL )) && [[ -z "$EMAIL_TO" ]]; then
+	append_emails "$DEFAULT_EMAIL"
+fi
+
+if (( ${#SECTIONS[@]} == 0 )); then
+	SECTION_ARG="all"
+else
+	SECTION_ARG=$(IFS=','; echo "${SECTIONS[*]}")
+fi
+
+[[ $(id -u) -eq 0 ]] || die "run as root (needs mail and vhost logs)"
+
+REPORT_FILE=$(mktemp)
+trap 'rm -f "$REPORT_FILE"' EXIT
+
+python3 - "$SECTION_ARG" "$FILTER_DOMAIN" "$LINES" "$THRESHOLD" >"$REPORT_FILE" <<'PY'
+import os, re, sys, subprocess
+from collections import Counter
+from datetime import datetime
+
+sections_arg, domain_filter, lines_s, threshold_s = sys.argv[1:]
+want = set(sections_arg.split(",")) if sections_arg != "all" else {"load", "hits", "mail", "lsws"}
+lines_n = int(lines_s)
+threshold = int(threshold_s)
+
+HTTPD_DOMAINS = "/var/log/httpd/domains"
+EXIM_MAIN = "/var/log/exim/mainlog"
+EXIM_PANIC = "/var/log/exim/paniclog"
+EXIM_PANIC_PREV = "/var/log/exim/paniclog.1"
+MAIL_LOG = "/var/log/mail.log"
+OLS_ERR = "/var/log/openlitespeed/error_log"
+OLS_ACC = "/var/log/openlitespeed/access_log"
+SKIP_DOMAINS = {"default", "sharedip", "suspended"}
+
+now = datetime.now().astimezone()
+cur_ym = f"{now.year:04d}{now.month:02d}"
+prev_ym = f"{now.year - 1:04d}12" if now.month == 1 else f"{now.year:04d}{now.month - 1:02d}"
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+def month_label(ym):
+    return f"{MONTHS[int(ym[4:6]) - 1]} {ym[0:4]}"
+
+def fmt_num(n):
+    n = int(n)
+    if n >= 1_000_000_000:
+        return f"{n / 1e9:.1f}B"
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 10_000:
+        return f"{n / 1e3:.1f}K"
+    return f"{n:,}"
+
+def fmt_kb(kb):
+    kb = int(kb)
+    if kb >= 1_048_576:
+        return f"{kb / 1048576:.1f} GB"
+    if kb >= 1024:
+        return f"{kb / 1024:.1f} MB"
+    return f"{kb:,} KB"
+
+def read_text(path, limit_bytes=8_000_000):
+    try:
+        with open(path, "rb") as f:
+            data = f.read(limit_bytes)
+        return data.decode("utf-8", "replace")
+    except OSError:
+        return None
+
+def parse_hist(path):
+    rows = {}
+    text = read_text(path)
+    if not text:
+        return rows
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 10 or parts[0].startswith("#"):
+            continue
+        try:
+            mm, yy = int(parts[0]), int(parts[1])
+            rows[f"{yy:04d}{mm:02d}"] = {
+                "hits": int(parts[2]),
+                "kbytes": int(parts[5]),
+                "pages": int(parts[8]),
+                "visits": int(parts[9]),
+            }
+        except ValueError:
+            continue
+    return rows
+
+def parse_top_urls(path):
+    text = read_text(path)
+    if not text:
+        return []
+    m = re.search(r'<A NAME="TOPURLS"></A>(.*?)(?:<A NAME="|</HTML>)', text, re.S | re.I)
+    if not m:
+        return []
+    # Webalizer follows the hit table with a second "By KBytes" table.
+    block = re.split(r"By KBytes", m.group(1), maxsplit=1)[0]
+    out = []
+    for tr in re.findall(r"<TR>(.*?)</TR>", block, re.S | re.I):
+        bolds = re.findall(r"<B>([\d,]+)</B>", tr)
+        href = re.search(r'<A HREF="[^"]*">([^<]*)</A>', tr)
+        if len(bolds) < 2 or not href:
+            continue
+        try:
+            hits = int(bolds[1].replace(",", ""))
+        except ValueError:
+            continue
+        out.append((hits, href.group(1).strip()))
+    out.sort(key=lambda r: -r[0])
+    return out
+
+def discover_sites():
+    found = []
+    if not os.path.isdir("/home"):
+        return found
+    for user in sorted(os.listdir("/home")):
+        domains = os.path.join("/home", user, "domains")
+        if not os.path.isdir(domains):
+            continue
+        for domain in sorted(os.listdir(domains)):
+            if domain in SKIP_DOMAINS:
+                continue
+            if domain_filter and domain != domain_filter:
+                continue
+            hist = os.path.join(domains, domain, "stats", "webalizer.hist")
+            if os.path.isfile(hist):
+                usage = os.path.join(domains, domain, "stats", f"usage_{cur_ym}.html")
+                found.append((domain, hist, usage))
+    return found
+
+REQ_RE = re.compile(r'^(\S+) \S+ \S+ \[[^\]]+\] "([A-Z]+) ([^" ]*) [^"]*" (\d{3}) ')
+WATCH_RE = re.compile(r"(mailer\.php|/mailer(?:/|$)|xmlrpc\.php|wp-login\.php|/\.env(?:\b|$)|/\.git/)", re.I)
+
+def scan_access(path):
+    text = read_text(path, limit_bytes=20_000_000)
+    if text is None:
+        return None
+    paths, statuses, watched = Counter(), Counter(), Counter()
+    total = 0
+    for line in text.splitlines():
+        m = REQ_RE.match(line)
+        if not m:
+            continue
+        total += 1
+        url, status = m.group(3), m.group(4)
+        path_only = url.split("?", 1)[0] or "/"
+        paths[path_only] += 1
+        statuses[status] += 1
+        if WATCH_RE.search(path_only):
+            watched[path_only] += 1
+    return {"total": total, "paths": paths, "statuses": statuses, "watched": watched}
+
+# ---------- collect ----------
+load1 = load5 = load15 = 0.0
+try:
+    load1, load5, load15 = (float(x) for x in open("/proc/loadavg").read().split()[:3])
+except OSError:
+    pass
+cpus = os.cpu_count() or 1
+mem = {}
+try:
+    for line in open("/proc/meminfo"):
+        k, v = line.split(":", 1)
+        mem[k] = int(v.strip().split()[0])
+except OSError:
+    pass
+uptime_s = 0.0
+try:
+    uptime_s = float(open("/proc/uptime").read().split()[0])
+except OSError:
+    pass
+st = os.statvfs("/")
+disk_total = st.f_frsize * st.f_blocks
+disk_used = disk_total - (st.f_frsize * st.f_bfree)
+disk_pct = (disk_used * 100 / disk_total) if disk_total else 0
+
+site_rows = []
+if "hits" in want:
+    for domain, hist, usage in discover_sites():
+        hist_rows = parse_hist(hist)
+        site_rows.append({
+            "domain": domain,
+            "cur": hist_rows.get(cur_ym, {}),
+            "prev": hist_rows.get(prev_ym, {}),
+            "urls": parse_top_urls(usage),
+        })
+
+access_rows = []
+if "hits" in want and os.path.isdir(HTTPD_DOMAINS):
+    for name in sorted(os.listdir(HTTPD_DOMAINS)):
+        if not name.endswith(".log") or name.endswith(".error.log"):
+            continue
+        domain = name[:-4]
+        if domain_filter and domain != domain_filter:
+            continue
+        scanned = scan_access(os.path.join(HTTPD_DOMAINS, name))
+        if scanned and scanned["total"]:
+            access_rows.append((domain, scanned))
+
+mail = {}
+if "mail" in want:
+    try:
+        mail["queue"] = subprocess.check_output(["exim", "-bpc"], text=True, stderr=subprocess.STDOUT).strip()
+    except Exception as exc:
+        mail["queue"] = f"unavailable ({exc})"
+    panic = [ln for ln in (read_text(EXIM_PANIC) or "").splitlines() if ln.strip()]
+    mail["panic"] = panic
+    prev = [ln for ln in (read_text(EXIM_PANIC_PREV) or "").splitlines() if ln.strip()]
+    mail["panic_prev"] = prev
+    main_lines = [ln for ln in (read_text(EXIM_MAIN) or "").splitlines() if ln.strip()]
+    kinds, interesting = Counter(), []
+    for ln in main_lines:
+        if "args: /usr/sbin/exim -q" in ln or "cwd=/var/spool/exim" in ln:
+            kinds["queue-run"] += 1
+        elif "daemon started" in ln:
+            kinds["daemon"] += 1
+            interesting.append(ln)
+        elif "<=" in ln:
+            kinds["accepted"] += 1
+            interesting.append(ln)
+        elif "=>" in ln or " -> " in ln:
+            kinds["delivered"] += 1
+            interesting.append(ln)
+        elif "**" in ln or "reject" in ln.lower():
+            kinds["failed"] += 1
+            interesting.append(ln)
+        elif "exim -bpc" in ln:
+            kinds["queue-count"] += 1
+        else:
+            kinds["other"] += 1
+            interesting.append(ln)
+    mail["main_n"] = len(main_lines)
+    mail["kinds"] = kinds
+    mail["interesting"] = interesting
+    mail["dovecot"] = [ln for ln in (read_text(MAIL_LOG) or "").splitlines() if ln.strip()]
+
+lsws = {}
+if "lsws" in want:
+    try:
+        ps = subprocess.check_output(["ps", "-eo", "pid,args", "--no-headers"], text=True)
+    except Exception:
+        ps = ""
+    procs = []
+    for ln in ps.splitlines():
+        if "openlitespeed" in ln or re.search(r"\blshttpd\b", ln):
+            if "da-load" in ln or "python3 - " in ln:
+                continue
+            procs.append(ln.strip())
+    lsws["procs"] = procs
+    try:
+        lsws["ctrl"] = subprocess.check_output(
+            ["/usr/local/lsws/bin/lswsctrl", "status"], text=True, stderr=subprocess.STDOUT
+        ).strip()
+    except Exception as exc:
+        lsws["ctrl"] = str(exc).strip()
+    err_lines = [ln for ln in (read_text(OLS_ERR) or "").splitlines() if ln.strip()]
+    grouped = Counter()
+    for ln in err_lines:
+        msg = re.sub(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \[[A-Z]+\] \[\d+\] ", "", ln)
+        grouped[msg] += 1
+    lsws["err_n"] = len(err_lines)
+    lsws["grouped"] = grouped
+    lsws["acc_size"] = os.path.getsize(OLS_ACC) if os.path.isfile(OLS_ACC) else -1
+
+# ---------- alerts ----------
+alerts = []
+if "load" in want:
+    if load1 >= cpus:
+        alerts.append(f"load {load1:.2f} is at or above {cpus} cores")
+    avail, total = mem.get("MemAvailable", 0), mem.get("MemTotal", 1) or 1
+    if avail and avail * 100 / total < 10:
+        alerts.append(f"memory available {avail * 100 / total:.0f}%")
+    if disk_pct >= 90:
+        alerts.append(f"disk / is {disk_pct:.0f}% full")
+
+if "hits" in want:
+    if domain_filter and not site_rows:
+        print(f"No Webalizer history for {domain_filter}")
+        sys.exit(1)
+    for row in sorted(site_rows, key=lambda r: -r["cur"].get("hits", 0)):
+        hits = row["cur"].get("hits", 0)
+        prev_hits = row["prev"].get("hits", 0)
+        if hits >= threshold and (prev_hits == 0 or hits >= prev_hits * 3):
+            if prev_hits:
+                ratio = (hits - prev_hits) * 100 / prev_hits
+                alerts.append(
+                    f"{row['domain']}  {fmt_num(hits)} hits {month_label(cur_ym)} "
+                    f"({fmt_num(prev_hits)} in {month_label(prev_ym)}, {ratio:+.0f}%)"
+                )
+            else:
+                alerts.append(f"{row['domain']}  {fmt_num(hits)} hits {month_label(cur_ym)}")
+        for h, path in row["urls"]:
+            if h >= threshold:
+                alerts.append(f"{row['domain']} {path}  {fmt_num(h)} hits")
+
+if "mail" in want and mail.get("panic"):
+    alerts.append(f"exim panic log has {len(mail['panic'])} lines")
+try:
+    qn = int(str(mail.get("queue", "0")).strip())
+except ValueError:
+    qn = 0
+if "mail" in want and qn >= 50:
+    alerts.append(f"exim queue has {qn} messages")
+
+if "lsws" in want and not any("main" in p for p in lsws.get("procs", [])):
+    alerts.append("OpenLiteSpeed is not running")
+
+# ---------- render ----------
+out = []
+def add(line=""):
+    out.append(line)
+
+host = os.uname().nodename
+try:
+    host = subprocess.check_output(["hostname", "-f"], text=True).strip() or host
+except Exception:
+    pass
+days, rem = divmod(int(uptime_s), 86400)
+hours, mins = divmod(rem, 3600)[0], divmod(rem, 3600)[1] // 60
+
+add(f"Server load — {host}")
+add(now.strftime("%a %b %-d %H:%M:%S %Z %Y") + f"   up {days}d {hours}h {mins}m")
+if domain_filter:
+    add(f"Domain filter: {domain_filter}")
+add()
+add("ALERTS")
+if alerts:
+    for a in alerts:
+        add(f"  {a}")
+else:
+    add("  none")
+add()
+
+if "load" in want:
+    def gb(key):
+        return mem.get(key, 0) / 1024 / 1024
+    add("LOAD")
+    add(f"  {load1:.2f}  {load5:.2f}  {load15:.2f}    {cpus} cores, 1m is {(load1 / cpus) * 100:.0f}% of capacity")
+    add(f"  Mem   {gb('MemTotal') - gb('MemAvailable'):.1f}G used / {gb('MemTotal'):.1f}G    available {gb('MemAvailable'):.1f}G")
+    if gb("SwapTotal"):
+        add(f"  Swap  {gb('SwapTotal') - gb('SwapFree'):.1f}G used / {gb('SwapTotal'):.1f}G")
+    gib = 1024 ** 3
+    add(f"  Disk  /  {disk_used / gib:.0f}G / {disk_total / gib:.0f}G ({disk_pct:.0f}%)")
+    add("  Top CPU")
+    try:
+        ps = subprocess.check_output(
+            ["ps", "-eo", "pcpu,pmem,rss,args", "--sort=-pcpu", "--no-headers"], text=True
+        )
+    except Exception as exc:
+        ps = ""
+        add(f"    (ps failed: {exc})")
+    shown = 0
+    skip_re = re.compile(r"cursor-server|/bin/ps |da-load|python3 - ")
+    for line in ps.splitlines():
+        line = line.strip()
+        if not line or skip_re.search(line):
+            continue
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        cpu, _pmem, rss, args = parts
+        cmd = args if len(args) <= 72 else args[:69] + "..."
+        add(f"    {float(cpu):5.1f}%  {int(rss) / 1024:7.0f}M  {cmd}")
+        shown += 1
+        if shown >= 6:
+            break
+    add()
+
+if "hits" in want:
+    add(f"HOT FILES  (Webalizer {month_label(cur_ym)}, through last tally)")
+    if not site_rows:
+        add("  no Webalizer history found")
+    for row in sorted(site_rows, key=lambda r: -r["cur"].get("hits", 0)):
+        cur, prev = row["cur"], row["prev"]
+        hits = cur.get("hits", 0)
+        if hits == 0 and not domain_filter:
+            continue
+        prev_hits = prev.get("hits", 0)
+        extra = ""
+        if prev_hits:
+            extra = f"   prev {fmt_num(prev_hits)} ({(hits - prev_hits) * 100 / prev_hits:+.0f}%)"
+        add(
+            f"  {row['domain']:<28} {fmt_num(hits):>8} hits"
+            f"  {fmt_num(cur.get('visits', 0)):>8} visits"
+            f"  {fmt_kb(cur.get('kbytes', 0)):>10}{extra}"
+        )
+        top = row["urls"][:8]
+        if not top:
+            add("    (no URL table)")
+        for h, path in top:
+            mark = " !" if h >= threshold else ""
+            add(f"    {fmt_num(h):>8}  {path}{mark}")
+        mailers = [(h, p) for h, p in row["urls"] if re.search(r"mailer|send-mail", p, re.I)]
+        shown_paths = {p for _h, p in top}
+        for h, p in mailers:
+            if p not in shown_paths:
+                add(f"    {fmt_num(h):>8}  {p}")
+        if not mailers:
+            add("    mailer.php / send-mail.php: not in this month's URL table")
+    add()
+    add("TODAY  (vhost access logs, current file)")
+    if not access_rows:
+        add("  no access logs matched")
+    watched_all = []
+    for domain, scanned in sorted(access_rows, key=lambda r: -r[1]["total"]):
+        bits = []
+        for code in ("200", "301", "302", "304", "403", "404", "500", "503"):
+            if scanned["statuses"].get(code):
+                bits.append(f"{code}:{scanned['statuses'][code]}")
+        add(f"  {domain:<28} {scanned['total']:>6} req   {'  '.join(bits)}")
+        for path_s, n in scanned["paths"].most_common(5):
+            add(f"    {n:>6}  {path_s}")
+        for path_s, n in scanned["watched"].items():
+            watched_all.append((n, domain, path_s))
+    if watched_all:
+        add("  Watched paths (mailer, .env, wp-login, xmlrpc, .git)")
+        for n, domain, path_s in sorted(watched_all, key=lambda r: -r[0])[:lines_n]:
+            add(f"    {n:>6}  {domain} {path_s}")
+    elif access_rows:
+        add("  Watched paths: none in today's logs")
+    add()
+
+if "mail" in want:
+    add("MAIL")
+    add(f"  Exim queue: {mail['queue']}")
+    add(f"  Panic log: {len(mail['panic'])} lines ({EXIM_PANIC})")
+    for ln in mail["panic"][-lines_n:]:
+        add(f"    {ln[:160]}")
+    if not mail["panic"] and mail["panic_prev"]:
+        msgs = Counter()
+        last = mail["panic_prev"][-1]
+        for ln in mail["panic_prev"]:
+            m = re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ (.*)$", ln)
+            msgs[m.group(1) if m else ln] += 1
+        top_msg, top_n = msgs.most_common(1)[0]
+        add(f"  Last rotated panic ({len(mail['panic_prev'])} lines): {top_n}x {top_msg[:110]}")
+        add(f"    {last[:160]}")
+    kind_s = "  ".join(f"{k}:{v}" for k, v in mail["kinds"].most_common()) or "empty"
+    add(f"  Main log: {mail['main_n']} lines   {kind_s}")
+    if mail["interesting"]:
+        add("  Recent non-queue lines:")
+        for ln in mail["interesting"][-lines_n:]:
+            add(f"    {ln[:160]}")
+    elif mail["main_n"]:
+        add("  Recent lines are queue runners only.")
+    add(f"  {MAIL_LOG}: {len(mail['dovecot'])} lines")
+    for ln in mail["dovecot"][-min(lines_n, 8):]:
+        add(f"    {ln[:160]}")
+    add()
+
+if "lsws" in want:
+    add("OPENLITESPEED")
+    procs = lsws["procs"]
+    mains = [p for p in procs if "main" in p]
+    others = [p for p in procs if "main" not in p]
+    if mains:
+        add(f"  Processes: {len(mains)} main, {len(others)} other")
+        for p in procs[:8]:
+            add(f"    {p}")
+    else:
+        add("  Processes: none (lshttpd is not running)")
+    add(f"  lswsctrl: {lsws['ctrl'] or 'ok'}")
+    if mains and "not running" in lsws["ctrl"].lower():
+        add("  Note: workers are up; lswsctrl does not see a pid file.")
+    add(f"  Error log: {lsws['err_n']} lines ({OLS_ERR})")
+    for msg, n in lsws["grouped"].most_common(lines_n):
+        add(f"    {n:>4}  {msg[:140]}")
+    if lsws["acc_size"] == 0:
+        add(f"  Server access log is empty. Vhost hits are in {HTTPD_DOMAINS}/*.log")
+    elif lsws["acc_size"] > 0:
+        add(f"  Server access log: {lsws['acc_size']} bytes ({OLS_ACC})")
+    add()
+
+sys.stdout.write("\n".join(out).rstrip() + "\n")
+PY
+
+alert_lines=()
+in_alerts=0
+while IFS= read -r line; do
+	if [[ "$line" == "ALERTS" ]]; then
+		in_alerts=1
+		continue
+	fi
+	if (( in_alerts )); then
+		[[ -z "$line" ]] && break
+		[[ "$line" == "  none" ]] && break
+		alert_lines+=("${line#"  "}")
+	fi
+done <"$REPORT_FILE"
+
+if (( ! QUIET )); then
+	cat "$REPORT_FILE"
+fi
+
+if [[ -n "$EMAIL_TO" ]]; then
+	host=$(hostname -f 2>/dev/null || hostname)
+	from="$MAIL_FROM"
+	if [[ -n "$EMAIL_SUBJECT" ]]; then
+		subject="$EMAIL_SUBJECT"
+	elif (( ${#alert_lines[@]} > 0 )); then
+		first="${alert_lines[0]:0:140}"
+		if (( ${#alert_lines[@]} > 1 )); then
+			subject="ALERT: ${host} — ${first} (+$(( ${#alert_lines[@]} - 1 )))"
+		else
+			subject="ALERT: ${host} — ${first}"
+		fi
+	else
+		subject="Server load — ${host}"
+	fi
+	subject=${subject//$'\n'/ }
+
+	mailer=()
+	if [[ -r "$MSMTP_CONFIG" && -x "$MSMTP_BIN" ]]; then
+		mailer=("$MSMTP_BIN" -C "$MSMTP_CONFIG" -t)
+	elif [[ -x "$SENDMAIL" ]]; then
+		mailer=("$SENDMAIL" -t -oi -f "$from")
+	else
+		die "no mailer available (need msmtp+$MSMTP_CONFIG or sendmail)"
+	fi
+
+	if ! {
+		printf 'From: Server Load <%s>\n' "$from"
+		printf 'To: %s\n' "$EMAIL_TO"
+		printf 'Subject: %s\n' "$subject"
+		printf 'MIME-Version: 1.0\n'
+		printf 'Content-Type: text/plain; charset=UTF-8\n'
+		printf 'Content-Transfer-Encoding: 8bit\n'
+		printf 'X-Mailer: da-load\n'
+		printf '\n'
+		cat "$REPORT_FILE"
+		printf '\n--\nGenerated on %s by /root/bin/%s\n' "$host" "$INV"
+	} | "${mailer[@]}"; then
+		die "mail send failed for: $EMAIL_TO"
+	fi
+
+	if (( ! QUIET )); then
+		echo
+		echo "(emailed to $EMAIL_TO via ${mailer[0]})"
+	fi
+fi

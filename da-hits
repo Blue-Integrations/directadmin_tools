@@ -1,0 +1,595 @@
+#!/usr/bin/env bash
+# da-hits — compact DirectAdmin web-hit summary (Webalizer / AWStats)
+# Usage: da-hits [-u user] [-d domain] [-m months] [-e email] [-v] [-q] [--json]
+
+set -euo pipefail
+
+MONTHS=6
+VERBOSE=0
+JSON=0
+QUIET=0
+FILTER_USER=""
+FILTER_DOMAIN=""
+EMAIL_TO=""
+EMAIL_SUBJECT=""
+USERS_DIR=/usr/local/directadmin/data/users
+SENDMAIL=${SENDMAIL:-/usr/sbin/sendmail}
+MSMTP_BIN=${MSMTP_BIN:-/usr/bin/msmtp}
+MSMTP_CONFIG=${MSMTP_CONFIG:-/root/.config/da-hits/msmtprc}
+MAIL_FROM="dahits@blueintegrations.com"
+
+usage() {
+	cat <<'EOF'
+Usage: da-hits [options]
+
+Summarize DirectAdmin web stats for the current month, with a short
+lookback at previous months (hits-focused, not a full report dump).
+
+Options:
+  -u, --user USER       Limit to one DirectAdmin user
+  -d, --domain DOMAIN   Limit to one domain (or subdomain label)
+  -m, --months N        History depth (default: 6)
+  -e, --email ADDR      Email the report (comma-separated for multiple)
+                        Repeatable: -e a@x.com -e b@y.com
+  -s, --subject TEXT    Override email subject
+  -q, --quiet           Suppress stdout (useful with --email / cron)
+                        Outbound mail uses SMTP via msmtp when
+                        /root/.config/da-hits/msmtprc exists
+                        (From: dahits@blueintegrations.com).
+  -v, --verbose         Per-domain rows for every history month
+  --json                Machine-readable output (not with --email)
+  -h, --help            Show this help
+
+Reads Webalizer history under ~/domains/*/stats/ (this server).
+If AWStats data appears under ~/domains/*/awstats/, that is used instead.
+
+Examples:
+  da-hits -d sucheckicontracting.com
+  da-hits -d sucheckicontracting.com -e taylor@sucheckicontracting.com -q
+EOF
+}
+
+die() { echo "da-hits: $*" >&2; exit 1; }
+
+append_emails() {
+	local raw=$1 addr
+	IFS=',' read -ra _addrs <<<"$raw"
+	for addr in "${_addrs[@]}"; do
+		addr=$(echo "$addr" | tr -d '[:space:]')
+		[[ -z "$addr" ]] && continue
+		[[ "$addr" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] \
+			|| die "invalid email address: $addr"
+		if [[ -n "$EMAIL_TO" ]]; then
+			EMAIL_TO+=",$addr"
+		else
+			EMAIL_TO="$addr"
+		fi
+	done
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		-u|--user)   FILTER_USER="${2:-}"; shift 2 ;;
+		-d|--domain) FILTER_DOMAIN="${2:-}"; shift 2 ;;
+		-m|--months) MONTHS="${2:-}"; shift 2 ;;
+		-e|--email)
+			[[ -n "${2:-}" ]] || die "$1 requires an address"
+			append_emails "$2"
+			shift 2
+			;;
+		-s|--subject) EMAIL_SUBJECT="${2:-}"; shift 2 ;;
+		-q|--quiet) QUIET=1; shift ;;
+		-v|--verbose) VERBOSE=1; shift ;;
+		--json) JSON=1; shift ;;
+		-h|--help) usage; exit 0 ;;
+		*) die "unknown option: $1" ;;
+	esac
+done
+
+[[ "$MONTHS" =~ ^[0-9]+$ ]] && (( MONTHS >= 1 && MONTHS <= 120 )) \
+	|| die "--months must be 1..120"
+
+if (( JSON )) && [[ -n "$EMAIL_TO" ]]; then
+	die "--json cannot be combined with --email"
+fi
+
+[[ $(id -u) -eq 0 ]] || die "run as root (needs access to user stats dirs)"
+
+# ---------- helpers ----------
+
+fmt_num() {
+	local n=${1:-0}
+	if (( n >= 1000000000 )); then
+		awk -v n="$n" 'BEGIN{printf "%.1fB", n/1e9}'
+	elif (( n >= 1000000 )); then
+		awk -v n="$n" 'BEGIN{printf "%.1fM", n/1e6}'
+	elif (( n >= 10000 )); then
+		awk -v n="$n" 'BEGIN{printf "%.1fK", n/1e3}'
+	else
+		printf "%'d" "$n" 2>/dev/null || printf "%d" "$n"
+	fi
+}
+
+fmt_bytes_kb() {
+	# input is KBytes from webalizer / bytes from awstats
+	local unit="${2:-kb}" kb
+	if [[ "$unit" == "b" ]]; then
+		kb=$(( ${1:-0} / 1024 ))
+	else
+		kb=${1:-0}
+	fi
+	if (( kb >= 1048576 )); then
+		awk -v n="$kb" 'BEGIN{printf "%.1f GB", n/1048576}'
+	elif (( kb >= 1024 )); then
+		awk -v n="$kb" 'BEGIN{printf "%.1f MB", n/1024}'
+	else
+		printf "%d KB" "$kb"
+	fi
+}
+
+bar() {
+	# bar VALUE MAX WIDTH  (ASCII — portable in cron/SSH)
+	local v=$1 max=$2 w=${3:-10} filled i
+	(( max <= 0 )) && { printf '[%*s]' "$w" ''; return; }
+	filled=$(( v * w / max ))
+	(( filled > w )) && filled=$w
+	(( filled < 0 )) && filled=0
+	printf '['
+	for ((i=0; i<filled; i++)); do printf '#'; done
+	for ((i=filled; i<w; i++)); do printf '-'; done
+	printf ']'
+}
+
+month_label() {
+	# month_label MM YYYY -> "Aug 2026"
+	local m=$1 y=$2
+	local names=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
+	printf '%s %s' "${names[$((m - 1))]}" "$y"
+}
+
+ym_key() { printf '%04d%02d' "$2" "$1"; } # ym_key MM YYYY -> YYYYMM
+
+prev_ym() {
+	# prev_ym YYYYMM -> previous YYYYMM
+	local y=${1:0:4} m=$((10#${1:4:2}))
+	m=$((m - 1))
+	if (( m < 1 )); then m=12; y=$((y - 1)); fi
+	printf '%04d%02d' "$y" "$m"
+}
+
+# ---------- discovery ----------
+
+list_users() {
+	if [[ -n "$FILTER_USER" ]]; then
+		[[ -d "$USERS_DIR/$FILTER_USER" ]] || die "unknown user: $FILTER_USER"
+		echo "$FILTER_USER"
+		return
+	fi
+	if [[ -d "$USERS_DIR" ]]; then
+		find "$USERS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+	else
+		# fallback: homes that look like DA users
+		find /home -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+			| grep -Ev '^(tmp|lost\+found)$' | sort
+	fi
+}
+
+user_home() {
+	getent passwd "$1" | cut -d: -f6
+}
+
+# Emit TSV lines:
+# source  user  site  YYYYMM  hits  files  pages  visits  sites  kbytes  firstday  lastday
+# site is domain or domain/sub
+
+parse_webalizer_hist() {
+	local user=$1 site=$2 hist=$3
+	[[ -f "$hist" && -r "$hist" ]] || return 0
+	awk -v user="$user" -v site="$site" '
+		/^#/ || NF < 10 { next }
+		$3+0 == 0 && $4+0 == 0 && $9+0 == 0 { next }
+		{
+			mm=$1+0; yy=$2+0
+			printf "webalizer\t%s\t%s\t%04d%02d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+				user, site, yy, mm, $3+0, $4+0, $9+0, $10+0, $5+0, $6+0, $7+0, $8+0
+		}
+	' "$hist"
+}
+
+parse_awstats_file() {
+	local user=$1 site=$2 file=$3 yyyymm=$4
+	[[ -f "$file" && -r "$file" ]] || return 0
+	# Sum BEGIN_DAY lines: day hits pages views bytes [visits...]
+	# Also pull TotalVisits / TotalUnique from GENERAL when present.
+	awk -v user="$user" -v site="$site" -v ym="$yyyymm" '
+		BEGIN { hits=0; pages=0; views=0; bytes=0; visits=0; uniques=0; in_day=0; firstd=0; lastd=0 }
+		/^TotalVisits/ { visits=$2+0 }
+		/^TotalUnique/ { uniques=$2+0 }
+		/^BEGIN_DAY/ { in_day=1; next }
+		/^END_DAY/ { in_day=0; next }
+		in_day && $1 ~ /^[0-9]+$/ {
+			d=$1+0
+			if (firstd==0 || d<firstd) firstd=d
+			if (d>lastd) lastd=d
+			hits+=$2+0
+			pages+=$3+0
+			views+=$4+0
+			bytes+=$5+0
+			if (NF>=6) visits+=$6+0
+		}
+		END {
+			if (hits+pages+views+visits == 0) exit
+			kb=int(bytes/1024)
+			# files≈pages not reliable; leave files=views (downloaded)
+			printf "awstats\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+				user, site, ym, hits, views, pages, visits, uniques, kb, firstd, lastd
+		}
+	' "$file"
+}
+
+collect_site() {
+	local user=$1 home=$2 domain=$3 stats_root=$4 label=$5
+	# Prefer AWStats if monthly data files exist
+	local aw_dir="$stats_root/awstats"
+	local found_aw=0
+	if [[ -d "$aw_dir" ]]; then
+		local f base mm yy yyyymm
+		# Common DA layouts: awstats/data/awstatsMMYYYY.domain.txt
+		#                   awstats/awstats.MMYYYY.domain.txt
+		while IFS= read -r -d '' f; do
+			base=$(basename "$f")
+			if [[ "$base" =~ awstats([0-9]{2})([0-9]{4})\. ]]; then
+				mm="${BASH_REMATCH[1]}"; yy="${BASH_REMATCH[2]}"
+			elif [[ "$base" =~ awstats\.([0-9]{2})([0-9]{4})\. ]]; then
+				mm="${BASH_REMATCH[1]}"; yy="${BASH_REMATCH[2]}"
+			else
+				continue
+			fi
+			yyyymm=$(printf '%04d%02d' "$((10#$yy))" "$((10#$mm))")
+			parse_awstats_file "$user" "$label" "$f" "$yyyymm"
+			found_aw=1
+		done < <(find "$aw_dir" -type f \( -name 'awstats*.txt' -o -name 'awstats.*.txt' \) -print0 2>/dev/null)
+	fi
+	(( found_aw )) && return 0
+
+	local hist="$stats_root/stats/webalizer.hist"
+	# subdomain stats live in stats/<sub>/webalizer.hist — caller handles via label path
+	if [[ -f "$hist" ]]; then
+		parse_webalizer_hist "$user" "$label" "$hist"
+	fi
+}
+
+collect_all() {
+	local user home domain subdir hist
+	while IFS= read -r user; do
+		home=$(user_home "$user")
+		[[ -n "$home" && -d "$home/domains" ]] || continue
+		for domain_path in "$home"/domains/*/; do
+			[[ -d "$domain_path" ]] || continue
+			domain=$(basename "$domain_path")
+			[[ "$domain" == "default" || "$domain" == "sharedip" || "$domain" == "suspended" ]] && continue
+			if [[ -n "$FILTER_DOMAIN" && "$domain" != "$FILTER_DOMAIN" && "$FILTER_DOMAIN" != *".$domain" ]]; then
+				# allow exact domain or subdomain label match later
+				:
+			fi
+			if [[ -n "$FILTER_DOMAIN" ]]; then
+				if [[ "$domain" == "$FILTER_DOMAIN" ]]; then
+					collect_site "$user" "$home" "$domain" "$domain_path" "$domain"
+				fi
+				# subdomain folder under stats/
+				if [[ -f "$domain_path/stats/$FILTER_DOMAIN/webalizer.hist" ]]; then
+					parse_webalizer_hist "$user" "$domain/$FILTER_DOMAIN" \
+						"$domain_path/stats/$FILTER_DOMAIN/webalizer.hist"
+				fi
+				# also match domain/sub form
+				if [[ "$FILTER_DOMAIN" == */* ]]; then
+					local parent="${FILTER_DOMAIN%%/*}" sub="${FILTER_DOMAIN#*/}"
+					if [[ "$domain" == "$parent" && -f "$domain_path/stats/$sub/webalizer.hist" ]]; then
+						parse_webalizer_hist "$user" "$FILTER_DOMAIN" \
+							"$domain_path/stats/$sub/webalizer.hist"
+					fi
+				fi
+				continue
+			fi
+
+			collect_site "$user" "$home" "$domain" "$domain_path" "$domain"
+			# subdomain webalizer histories
+			if [[ -d "$domain_path/stats" ]]; then
+				for subdir in "$domain_path"/stats/*/; do
+					[[ -d "$subdir" ]] || continue
+					hist="${subdir}webalizer.hist"
+					[[ -f "$hist" ]] || continue
+					parse_webalizer_hist "$user" "$domain/$(basename "$subdir")" "$hist"
+				done
+			fi
+		done
+	done < <(list_users)
+}
+
+# ---------- aggregate ----------
+
+TMP=$(mktemp)
+REPORT_FILE=""
+trap 'rm -f "$TMP" ${REPORT_FILE:+"$REPORT_FILE"} "${TMP}.v"' EXIT
+
+collect_all >"$TMP"
+
+if [[ ! -s "$TMP" ]]; then
+	echo "No Webalizer/AWStats history found."
+	if [[ -x /usr/local/directadmin/directadmin ]]; then
+		aw=$(/usr/local/directadmin/directadmin c 2>/dev/null | awk -F= '/^awstats=/{print $2}')
+		wb=$(/usr/local/directadmin/directadmin c 2>/dev/null | awk -F= '/^webalizer=/{print $2}')
+		echo "DA config: awstats=${aw:-?}  webalizer=${wb:-?}"
+	fi
+	exit 1
+fi
+
+CUR_Y=$(date +%Y)
+CUR_M=$(date +%-m)
+CUR_D=$(date +%-d)
+CUR_YM=$(printf '%04d%02d' "$CUR_Y" "$CUR_M")
+
+# Build ordered list of YYYYMM keys to show
+declare -a YM_LIST=()
+ym="$CUR_YM"
+for ((i=0; i<MONTHS; i++)); do
+	YM_LIST+=("$ym")
+	ym=$(prev_ym "$ym")
+done
+
+# Detect primary source
+SOURCE=$(awk -F'\t' '{print $1; exit}' "$TMP")
+
+# Totals per YYYYMM: hits files pages visits sites kbytes
+declare -A T_HITS T_FILES T_PAGES T_VISITS T_SITES T_KB
+declare -A SITE_CUR_HITS SITE_CUR_VISITS SITE_CUR_KB SITE_CUR_PAGES
+
+while IFS=$'\t' read -r src user site yyyymm hits files pages visits sites kbytes firstd lastd; do
+	keep=0
+	for k in "${YM_LIST[@]}"; do [[ "$k" == "$yyyymm" ]] && keep=1 && break; done
+	(( keep )) || continue
+
+	T_HITS[$yyyymm]=$(( ${T_HITS[$yyyymm]:-0} + hits ))
+	T_FILES[$yyyymm]=$(( ${T_FILES[$yyyymm]:-0} + files ))
+	T_PAGES[$yyyymm]=$(( ${T_PAGES[$yyyymm]:-0} + pages ))
+	T_VISITS[$yyyymm]=$(( ${T_VISITS[$yyyymm]:-0} + visits ))
+	T_SITES[$yyyymm]=$(( ${T_SITES[$yyyymm]:-0} + sites ))
+	T_KB[$yyyymm]=$(( ${T_KB[$yyyymm]:-0} + kbytes ))
+
+	if [[ "$yyyymm" == "$CUR_YM" ]]; then
+		SITE_CUR_HITS[$site]=$(( ${SITE_CUR_HITS[$site]:-0} + hits ))
+		SITE_CUR_VISITS[$site]=$(( ${SITE_CUR_VISITS[$site]:-0} + visits ))
+		SITE_CUR_KB[$site]=$(( ${SITE_CUR_KB[$site]:-0} + kbytes ))
+		SITE_CUR_PAGES[$site]=$(( ${SITE_CUR_PAGES[$site]:-0} + pages ))
+	fi
+
+	if (( VERBOSE )); then
+		# stash per-site history in temp side file
+		printf '%s\t%s\t%d\t%d\n' "$yyyymm" "$site" "$hits" "$visits" >>"${TMP}.v"
+	fi
+done <"$TMP"
+
+# ---------- JSON ----------
+if (( JSON )); then
+	python3 - "$TMP" "$CUR_YM" "$CUR_D" "$SOURCE" "$MONTHS" "${YM_LIST[@]}" <<'PY'
+import json, sys
+path, cur_ym, cur_d, source, months = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+ym_list = sys.argv[6:]
+rows = []
+with open(path) as f:
+    for line in f:
+        src, user, site, yyyymm, hits, files, pages, visits, sites, kbytes, firstd, lastd = line.rstrip("\n").split("\t")
+        if yyyymm not in ym_list:
+            continue
+        rows.append({
+            "source": src, "user": user, "site": site, "yyyymm": yyyymm,
+            "hits": int(hits), "files": int(files), "pages": int(pages),
+            "visits": int(visits), "sites": int(sites), "kbytes": int(kbytes),
+            "first_day": int(firstd), "last_day": int(lastd),
+        })
+months_out = []
+for ym in ym_list:
+    subset = [r for r in rows if r["yyyymm"] == ym]
+    months_out.append({
+        "yyyymm": ym,
+        "hits": sum(r["hits"] for r in subset),
+        "visits": sum(r["visits"] for r in subset),
+        "pages": sum(r["pages"] for r in subset),
+        "kbytes": sum(r["kbytes"] for r in subset),
+        "sites": sorted({r["site"] for r in subset}),
+    })
+cur = next((m for m in months_out if m["yyyymm"] == cur_ym), None)
+by_site = {}
+for r in rows:
+    if r["yyyymm"] != cur_ym:
+        continue
+    s = by_site.setdefault(r["site"], {"hits": 0, "visits": 0, "pages": 0, "kbytes": 0})
+    for k in ("hits", "visits", "pages", "kbytes"):
+        s[k] += r[k]
+print(json.dumps({
+    "source": source,
+    "current_yyyymm": cur_ym,
+    "day_of_month": cur_d,
+    "current": cur,
+    "domains_this_month": [
+        {"site": k, **v} for k, v in sorted(by_site.items(), key=lambda kv: -kv[1]["hits"])
+    ],
+    "months": months_out,
+}, indent=2))
+PY
+	exit 0
+fi
+
+# ---------- human output ----------
+
+cur_hits=${T_HITS[$CUR_YM]:-0}
+cur_visits=${T_VISITS[$CUR_YM]:-0}
+cur_pages=${T_PAGES[$CUR_YM]:-0}
+cur_kb=${T_KB[$CUR_YM]:-0}
+
+# Pace vs previous full month
+PREV_YM=$(prev_ym "$CUR_YM")
+prev_hits=${T_HITS[$PREV_YM]:-0}
+pace_note=""
+if (( prev_hits > 0 && CUR_D > 0 )); then
+	# days in previous month
+	prev_y=${PREV_YM:0:4}
+	prev_m=$((10#${PREV_YM:4:2}))
+	prev_days=$(date -d "$prev_y-$prev_m-01 +1 month -1 day" +%d)
+	projected=$(( cur_hits * prev_days / CUR_D ))
+	delta=$(( (projected - prev_hits) * 100 / prev_hits ))
+	if (( delta > 0 )); then
+		pace_note=$(printf "pace ~%s hits/mo (%+d%% vs %s)" "$(fmt_num "$projected")" "$delta" "$(month_label "$prev_m" "$prev_y")")
+	else
+		pace_note=$(printf "pace ~%s hits/mo (%+d%% vs %s)" "$(fmt_num "$projected")" "$delta" "$(month_label "$prev_m" "$prev_y")")
+	fi
+fi
+
+max_hits=0
+for ym in "${YM_LIST[@]}"; do
+	h=${T_HITS[$ym]:-0}
+	(( h > max_hits )) && max_hits=$h
+done
+
+REPORT_FILE=$(mktemp)
+
+{
+	echo "DirectAdmin web hits — $(month_label "$CUR_M" "$CUR_Y") (day $CUR_D)"
+	echo "Source: $SOURCE"
+	[[ -n "$FILTER_USER" ]] && echo "User:   $FILTER_USER"
+	[[ -n "$FILTER_DOMAIN" ]] && echo "Domain: $FILTER_DOMAIN"
+	echo
+
+	echo "This month"
+	printf '  Hits %-10s  Visits %-10s  Pages %-10s  Transfer %s\n' \
+		"$(fmt_num "$cur_hits")" \
+		"$(fmt_num "$cur_visits")" \
+		"$(fmt_num "$cur_pages")" \
+		"$(fmt_bytes_kb "$cur_kb")"
+	[[ -n "$pace_note" ]] && echo "  $pace_note"
+
+	# Top domains this month (cap at 8 unless filtered/verbose)
+	if (( ${#SITE_CUR_HITS[@]} > 0 )); then
+		echo
+		echo "  By domain"
+		mapfile -t ranked < <(
+			for s in "${!SITE_CUR_HITS[@]}"; do
+				printf '%d\t%s\n' "${SITE_CUR_HITS[$s]}" "$s"
+			done | sort -nr
+		)
+		limit=8
+		if (( VERBOSE )) || [[ -n "$FILTER_DOMAIN" ]] || (( ${#ranked[@]} <= 8 )); then
+			limit=${#ranked[@]}
+		fi
+		shown=0
+		other_hits=0
+		for row in "${ranked[@]}"; do
+			h=${row%%$'\t'*}
+			s=${row#*$'\t'}
+			if (( shown < limit )); then
+				printf '    %-36s  %8s hits' "$s" "$(fmt_num "$h")"
+				if (( VERBOSE )); then
+					printf '   %8s visits   %s' \
+						"$(fmt_num "${SITE_CUR_VISITS[$s]:-0}")" \
+						"$(fmt_bytes_kb "${SITE_CUR_KB[$s]:-0}")"
+				fi
+				echo
+				shown=$((shown + 1))
+			else
+				other_hits=$((other_hits + h))
+			fi
+		done
+		if (( other_hits > 0 )); then
+			rest=$(( ${#ranked[@]} - shown ))
+			printf '    %-36s  %8s hits\n' "+$rest more" "$(fmt_num "$other_hits")"
+		fi
+	fi
+
+	echo
+	echo "Recent months"
+	shown_hist=0
+	for ym in "${YM_LIST[@]}"; do
+		y=${ym:0:4}
+		m=$((10#${ym:4:2}))
+		h=${T_HITS[$ym]:-0}
+		v=${T_VISITS[$ym]:-0}
+		# Skip empty months unless verbose (keeps the lookback short)
+		if (( h == 0 && v == 0 && ! VERBOSE )); then
+			continue
+		fi
+		tag=""
+		[[ "$ym" == "$CUR_YM" ]] && tag=" MTD"
+		printf '  %s  %s  %8s hits  %8s visits%s\n' \
+			"$(month_label "$m" "$y")" \
+			"$(bar "$h" "$max_hits" 12)" \
+			"$(fmt_num "$h")" \
+			"$(fmt_num "$v")" \
+			"$tag"
+		shown_hist=$((shown_hist + 1))
+	done
+	(( shown_hist == 0 )) && echo "  (no history in range)"
+
+	if (( VERBOSE )) && [[ -f "${TMP}.v" ]]; then
+		echo
+		echo "Per-domain history"
+		mapfile -t sites_all < <(awk -F'\t' '{print $2}' "${TMP}.v" | sort -u)
+		for s in "${sites_all[@]}"; do
+			printf '  %s\n' "$s"
+			for ym in "${YM_LIST[@]}"; do
+				y=${ym:0:4}; m=$((10#${ym:4:2}))
+				hv=$(awk -F'\t' -v ym="$ym" -v s="$s" '$1==ym && $2==s {h+=$3; v+=$4} END{print h+0, v+0}' "${TMP}.v")
+				h=${hv%% *}; v=${hv##* }
+				(( h == 0 && v == 0 )) && continue
+				printf '    %s  %8s hits  %8s visits\n' \
+					"$(month_label "$m" "$y")" "$(fmt_num "$h")" "$(fmt_num "$v")"
+			done
+		done
+	fi
+} >"$REPORT_FILE"
+
+if (( ! QUIET )); then
+	cat "$REPORT_FILE"
+fi
+
+if [[ -n "$EMAIL_TO" ]]; then
+	host=$(hostname -f 2>/dev/null || hostname)
+	from="$MAIL_FROM"
+	if [[ -n "$EMAIL_SUBJECT" ]]; then
+		subject="$EMAIL_SUBJECT"
+	elif [[ -n "$FILTER_DOMAIN" ]]; then
+		subject="Web hits: ${FILTER_DOMAIN} — $(month_label "$CUR_M" "$CUR_Y")"
+	else
+		subject="Web hits summary — $(month_label "$CUR_M" "$CUR_Y")"
+	fi
+
+	# Prefer authenticated SMTP (msmtp) so mail isn't trapped by local
+	# virtual catch-all / never_users on this web host.
+	mailer=()
+	if [[ -r "$MSMTP_CONFIG" && -x "$MSMTP_BIN" ]]; then
+		mailer=("$MSMTP_BIN" -C "$MSMTP_CONFIG" -t)
+	elif [[ -x "$SENDMAIL" ]]; then
+		mailer=("$SENDMAIL" -t -oi -f "$from")
+	else
+		die "no mailer available (need msmtp+$MSMTP_CONFIG or sendmail)"
+	fi
+
+	if ! {
+		printf 'From: Web Hits <%s>\n' "$from"
+		printf 'To: %s\n' "$EMAIL_TO"
+		printf 'Subject: %s\n' "$subject"
+		printf 'MIME-Version: 1.0\n'
+		printf 'Content-Type: text/plain; charset=UTF-8\n'
+		printf 'Content-Transfer-Encoding: 8bit\n'
+		printf 'X-Mailer: da-hits\n'
+		printf '\n'
+		cat "$REPORT_FILE"
+		printf '\n--\nGenerated on %s by /root/bin/da-hits\n' "$host"
+	} | "${mailer[@]}"; then
+		die "mail send failed for: $EMAIL_TO"
+	fi
+
+	if (( ! QUIET )); then
+		echo
+		echo "(emailed to $EMAIL_TO via ${mailer[0]})"
+	fi
+fi
