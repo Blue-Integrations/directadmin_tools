@@ -3,8 +3,9 @@
 # da-load-mail — same report, emailed (quiet) like da-hits
 #
 #   da-load
-#   da-load mail|lsws|hits|load|topbyip
+#   da-load mail|lsws|hits|load|topbyip|guests
 #   da-load hits -d example.com
+#   da-load guests -d example.com
 #   da-load topbyip
 #   da-load-mail
 
@@ -45,11 +46,17 @@ Sections (default: all):
   mail                  Exim queue, panic log, mail.log
   lsws                  OpenLiteSpeed status and error log
                         (aliases: lightspeed, ols)
-  topbyip               Requests per client IP, one domain log at a time
+  topbyip               Requests per client IP, one domain log at a time.
+                        Listed IPs are reverse-looked-up (PTR).
                         Not included in the default snapshot
+  guests                Shop "who is online" check. Sessions that already
+                        passed the bot filter, and whether they are one
+                        address opening one product. Included in the
+                        default snapshot for domains that have the shop app.
 
 Options:
-  -d, --domain DOMAIN   Limit hits/access logs to one domain
+  -d, --domain DOMAIN   Limit hits, access logs, topbyip, and guests
+                        to one domain
   -n, --lines N         Sample depth (default: 12). For topbyip, caps
                         IPs listed per domain; omit it to list every IP
   -t, --threshold N     Flag a URL or spiked site at N hits (default: 100000)
@@ -68,6 +75,7 @@ Examples:
   da-load hits -d example.com
   da-load topbyip
   da-load topbyip -d example.com -n 20
+  da-load guests -d example.com
   da-load-mail
   da-load -e ops@example.com
 EOF
@@ -94,7 +102,7 @@ append_emails() {
 SECTIONS=()
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-		load|hits|mail|topbyip) SECTIONS+=("$1"); shift ;;
+		load|hits|mail|topbyip|guests) SECTIONS+=("$1"); shift ;;
 		lsws|lightspeed|ols) SECTIONS+=("lsws"); shift ;;
 		-d|--domain) FILTER_DOMAIN="${2:-}"; [[ -n "$FILTER_DOMAIN" ]] || die "$1 requires a domain"; shift 2 ;;
 		-n|--lines) LINES="${2:-}"; IP_CAP="${2:-}"; shift 2 ;;
@@ -133,12 +141,13 @@ REPORT_FILE=$(mktemp)
 trap 'rm -f "$REPORT_FILE"' EXIT
 
 python3 - "$SECTION_ARG" "$FILTER_DOMAIN" "$LINES" "$THRESHOLD" "$IP_CAP" >"$REPORT_FILE" <<'PY'
-import os, re, sys, subprocess
+import json, os, re, socket, sys, subprocess
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 sections_arg, domain_filter, lines_s, threshold_s, ip_cap_s = sys.argv[1:]
-want = set(sections_arg.split(",")) if sections_arg != "all" else {"load", "hits", "mail", "lsws"}
+want = set(sections_arg.split(",")) if sections_arg != "all" else {"load", "hits", "mail", "lsws", "guests"}
 lines_n = int(lines_s)
 threshold = int(threshold_s)
 ip_cap = int(ip_cap_s or "0")
@@ -272,6 +281,268 @@ def scan_access(path):
             watched[path_only] += 1
     return {"total": total, "paths": paths, "statuses": statuses, "watched": watched, "ips": ips}
 
+def rev_lookup(ip):
+    try:
+        name = socket.gethostbyaddr(ip)[0].rstrip(".")
+    except OSError:
+        return ""
+    return "" if name == ip else name
+
+def rev_many(ips):
+    if not ips:
+        return {}
+    prev = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(2.0)
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            names = list(pool.map(rev_lookup, ips))
+    finally:
+        socket.setdefaulttimeout(prev)
+    return dict(zip(ips, names))
+
+GUEST_PHP = r"""
+define('ES_SKIP_SESSION', true);
+$boot = $argv[1] ?? '';
+if ($boot === '' || !is_file($boot)) {
+    fwrite(STDERR, "missing bootstrap\n");
+    exit(1);
+}
+require $boot;
+try {
+    $pdo = db_connect(db_driver(), false);
+} catch (Throwable $e) {
+    fwrite(STDERR, "db: " . $e->getMessage() . "\n");
+    exit(1);
+}
+$tz = shop_timezone();
+$now = time();
+$presenceCut = $now - 600;
+$shapeCut = gmdate('c', $now - 1800);
+$dayCut = gmdate('c', $now - 86400);
+
+function guest_browser(string $ua): string {
+    if (preg_match('/Edg\/(\d+)/', $ua, $m)) {
+        return 'Edge ' . $m[1];
+    }
+    if (preg_match('/Chrome\/(\d+)/', $ua, $m)) {
+        return 'Chrome ' . $m[1];
+    }
+    if (preg_match('/Firefox\/(\d+)/', $ua, $m)) {
+        return 'Firefox ' . $m[1];
+    }
+    if (stripos($ua, 'Safari') !== false && preg_match('/Version\/(\d+(?:\.\d+)*)/', $ua, $m)) {
+        return 'Safari ' . $m[1];
+    }
+    $ua = trim($ua);
+    return $ua === '' ? '(empty)' : substr($ua, 0, 48);
+}
+
+function guest_prefix(string $ip): string {
+    if (str_contains($ip, ':')) {
+        $parts = explode(':', $ip);
+        return strtolower(implode(':', array_slice($parts, 0, 2)));
+    }
+    $parts = explode('.', $ip);
+    return ($parts[0] ?? '?') . '.' . ($parts[1] ?? '?');
+}
+
+$out = [
+    'tz' => $tz->getName(),
+    'guests' => 0,
+    'members' => 0,
+    'live_paths' => 0,
+    'live_products' => 0,
+    'repeated' => [],
+    'activity' => [
+        'hits' => 0, 'ips' => 0, 'sessions' => 0,
+        'product_hits' => 0, 'product_urls' => 0,
+        'top_path' => '', 'top_n' => 0,
+    ],
+    'browsers' => [],
+    'prefixes' => [],
+    'hours' => [],
+    'error' => '',
+];
+try {
+    $pdo->query('SELECT 1 FROM presence LIMIT 1');
+    $pdo->query('SELECT 1 FROM activity_log LIMIT 1');
+} catch (Throwable $e) {
+    $out['error'] = 'no presence table';
+    echo json_encode($out);
+    exit(0);
+}
+
+$guests = (int) $pdo->query("SELECT COUNT(*) FROM presence WHERE last_seen >= {$presenceCut} AND user_id = ''")->fetchColumn();
+$members = (int) $pdo->query("SELECT COUNT(*) FROM presence WHERE last_seen >= {$presenceCut} AND user_id != ''")->fetchColumn();
+$live = $pdo->query("SELECT path, COUNT(*) n FROM presence WHERE last_seen >= {$presenceCut} AND user_id = '' GROUP BY path")->fetchAll();
+$out['guests'] = $guests;
+$out['members'] = $members;
+$out['live_paths'] = count($live);
+$out['live_products'] = 0;
+$repeated = [];
+foreach ($live as $row) {
+    $path = (string) ($row['path'] ?? '');
+    $n = (int) ($row['n'] ?? 0);
+    if (str_starts_with(parse_url($path, PHP_URL_PATH) ?: $path, '/product/')) {
+        $out['live_products'] += $n;
+    }
+    if ($n > 1) {
+        $repeated[] = ['n' => $n, 'path' => $path];
+    }
+}
+usort($repeated, static fn ($a, $b) => $b['n'] <=> $a['n']);
+$out['repeated'] = array_slice($repeated, 0, 8);
+
+$st = $pdo->prepare("SELECT path, ip, session_id, user_agent FROM activity_log WHERE channel = 'web' AND created_at >= :since AND user_id = ''");
+$st->execute(['since' => $shapeCut]);
+$ips = [];
+$sess = [];
+$paths = [];
+$browsers = [];
+$prefixes = [];
+$productHits = 0;
+foreach ($st as $row) {
+    $path = (string) ($row['path'] ?? '');
+    $ip = (string) ($row['ip'] ?? '');
+    $sid = (string) ($row['session_id'] ?? '');
+    $ips[$ip] = true;
+    if ($sid !== '') {
+        $sess[$sid] = true;
+    }
+    $paths[$path] = ($paths[$path] ?? 0) + 1;
+    $b = guest_browser((string) ($row['user_agent'] ?? ''));
+    $browsers[$b] = ($browsers[$b] ?? 0) + 1;
+    $px = guest_prefix($ip);
+    $prefixes[$px] = ($prefixes[$px] ?? 0) + 1;
+    $only = parse_url($path, PHP_URL_PATH) ?: $path;
+    if (str_starts_with($only, '/product/')) {
+        $productHits++;
+    }
+}
+arsort($paths);
+arsort($browsers);
+arsort($prefixes);
+$topPath = '';
+$topN = 0;
+foreach ($paths as $path => $n) {
+    $topPath = $path;
+    $topN = $n;
+    break;
+}
+$productUrls = 0;
+foreach ($paths as $path => $_n) {
+    $only = parse_url($path, PHP_URL_PATH) ?: $path;
+    if (str_starts_with($only, '/product/')) {
+        $productUrls++;
+    }
+}
+$out['activity'] = [
+    'hits' => array_sum($paths),
+    'ips' => count($ips),
+    'sessions' => count($sess),
+    'product_hits' => $productHits,
+    'product_urls' => $productUrls,
+    'top_path' => $topPath,
+    'top_n' => $topN,
+];
+foreach (array_slice($browsers, 0, 6, true) as $name => $n) {
+    $out['browsers'][] = ['name' => $name, 'n' => $n];
+}
+foreach (array_slice($prefixes, 0, 6, true) as $name => $n) {
+    $out['prefixes'][] = ['prefix' => $name, 'n' => $n];
+}
+
+$st = $pdo->prepare("SELECT created_at, ip FROM activity_log WHERE channel = 'web' AND created_at >= :since AND user_id = ''");
+$st->execute(['since' => $dayCut]);
+$hours = [];
+foreach ($st as $row) {
+    try {
+        $dt = new DateTimeImmutable((string) $row['created_at']);
+    } catch (Throwable) {
+        continue;
+    }
+    $local = $dt->setTimezone($tz);
+    $key = $local->format('D H');
+    if (!isset($hours[$key])) {
+        $hours[$key] = ['label' => $key, 'sort' => $local->format('YmdH'), 'hits' => 0, 'ips' => []];
+    }
+    $hours[$key]['hits']++;
+    $hours[$key]['ips'][(string) ($row['ip'] ?? '')] = true;
+}
+uasort($hours, static fn ($a, $b) => $a['sort'] <=> $b['sort']);
+foreach ($hours as $bucket) {
+    if ($bucket['hits'] < 1) {
+        continue;
+    }
+    $out['hours'][] = [
+        'label' => $bucket['label'],
+        'hits' => $bucket['hits'],
+        'ips' => count($bucket['ips']),
+    ];
+}
+echo json_encode($out);
+"""
+
+def discover_shops():
+    found = []
+    if not os.path.isdir("/home"):
+        return found
+    for user in sorted(os.listdir("/home")):
+        domains = os.path.join("/home", user, "domains")
+        if not os.path.isdir(domains):
+            continue
+        for domain in sorted(os.listdir(domains)):
+            if domain in SKIP_DOMAINS:
+                continue
+            if domain_filter and domain != domain_filter:
+                continue
+            boot = os.path.join(domains, domain, "public_html", "includes", "bootstrap.php")
+            if os.path.isfile(boot):
+                found.append((domain, boot))
+    return found
+
+def guest_snapshot(boot):
+    try:
+        proc = subprocess.run(
+            ["php", "-r", GUEST_PHP, boot],
+            capture_output=True, text=True, timeout=40,
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "php failed").strip().splitlines()
+        return {"error": err[-1][:180] if err else "php failed"}
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"error": "shop query did not return JSON"}
+    if not isinstance(data, dict):
+        return {"error": "shop query did not return JSON"}
+    return data
+
+def guest_verdict(data):
+    if data.get("error"):
+        return "skip", data["error"]
+    guests = int(data.get("guests") or 0)
+    act = data.get("activity") or {}
+    hits = int(act.get("hits") or 0)
+    ips = int(act.get("ips") or 0)
+    sess = int(act.get("sessions") or 0)
+    ph = int(act.get("product_hits") or 0)
+    pu = int(act.get("product_urls") or 0)
+    top_n = int(act.get("top_n") or 0)
+    top_path = str(act.get("top_path") or "")
+    one_each = hits >= 8 and ips >= hits * 0.9 and sess >= hits * 0.9
+    if guests < 8 and hits < 30:
+        return "quiet", f"{guests} guests in the last 10 minutes"
+    if one_each and ph >= 8 and pu >= ph * 0.8:
+        if top_n and top_n / ph >= 0.5:
+            return "bots", f"mostly one product ({top_path}, {top_n} of {ph})"
+        return "bots", f"multiple products, one page each ({pu} urls, {ph} hits)"
+    if one_each:
+        return "bots", "one address and one session per hit"
+    return "mixed", "some sessions opened more than one page"
+
 # ---------- collect ----------
 load1 = load5 = load15 = 0.0
 try:
@@ -384,6 +655,13 @@ if "lsws" in want:
     lsws["grouped"] = grouped
     lsws["acc_size"] = os.path.getsize(OLS_ACC) if os.path.isfile(OLS_ACC) else -1
 
+guest_rows = []
+if "guests" in want:
+    for domain, boot in discover_shops():
+        data = guest_snapshot(boot)
+        kind, detail = guest_verdict(data)
+        guest_rows.append((domain, data, kind, detail))
+
 # ---------- alerts ----------
 alerts = []
 if "load" in want:
@@ -414,6 +692,18 @@ if "hits" in want:
         for h, path in row["urls"]:
             if h >= threshold:
                 alerts.append(f"{row['domain']} {path}  {fmt_num(h)} hits")
+
+if "guests" in want:
+    for domain, data, kind, detail in guest_rows:
+        if kind != "bots":
+            continue
+        guests = int(data.get("guests") or 0)
+        hot = [
+            h for h in data.get("hours") or []
+            if h.get("hits", 0) >= 200 and h.get("ips", 0) >= h.get("hits", 1) * 0.85
+        ]
+        if guests >= 15 or hot:
+            alerts.append(f"{domain} guest traffic looks like bots — {detail}")
 
 if "mail" in want and mail.get("panic"):
     alerts.append(f"exim panic log has {len(mail['panic'])} lines")
@@ -546,16 +836,85 @@ if "topbyip" in want:
     add("TOP BY IP  (each vhost access log, current file)")
     if not access_rows:
         add("  no access logs matched")
+    blocks = []
+    lookup_ips = []
+    seen_ips = set()
     for domain, scanned in sorted(access_rows, key=lambda r: (-r[1]["total"], r[0])):
+        ranked = scanned["ips"].most_common(ip_cap if ip_cap > 0 else None)
+        blocks.append((domain, scanned, ranked))
+        for ip, _n in ranked:
+            if ip not in seen_ips:
+                seen_ips.add(ip)
+                lookup_ips.append(ip)
+    names = rev_many(lookup_ips)
+    for domain, scanned, ranked in blocks:
         ips = scanned["ips"]
         add(f"  {domain:<28} {scanned['total']:>6} req   {len(ips)} ips")
-        ranked = ips.most_common(ip_cap if ip_cap > 0 else None)
         for ip, n in ranked:
             pct = (n * 100 / scanned["total"]) if scanned["total"] else 0
-            add(f"    {n:>7}  {pct:5.1f}%  {ip}")
+            name = names.get(ip) or ""
+            add(f"    {n:>7}  {pct:5.1f}%  {ip}" + (f"  {name}" if name else ""))
         hidden = len(ips) - len(ranked)
         if hidden > 0:
             add(f"    {hidden} more ips")
+    add()
+
+if "guests" in want:
+    add("GUESTS  (shop presence, last 10 minutes; shape is the last 30)")
+    if domain_filter and not guest_rows:
+        add(f"  {domain_filter} has no shop presence table")
+    elif not guest_rows:
+        add("  no shop with a presence table")
+    for domain, data, kind, detail in guest_rows:
+        if data.get("error"):
+            add(f"  {domain:<28} {detail}")
+            continue
+        act = data.get("activity") or {}
+        member_n = int(data.get("members") or 0)
+        member_label = "member" if member_n == 1 else "members"
+        add(
+            f"  {domain:<28} {data.get('guests', 0)} guests"
+            f"   {member_n} {member_label}"
+            f"   {data.get('live_paths', 0)} urls"
+            f"   {data.get('live_products', 0)} product hits"
+        )
+        add(f"    {kind} — {detail}")
+        add(
+            f"    30m  {act.get('hits', 0)} hits"
+            f"   {act.get('ips', 0)} ips"
+            f"   {act.get('sessions', 0)} sessions"
+            f"   {act.get('product_urls', 0)} product urls"
+        )
+        repeated = data.get("repeated") or []
+        if repeated:
+            add("    repeated in the live window:")
+            for row in repeated:
+                add(f"      {row.get('n', 0):>4}  {row.get('path', '')}")
+        else:
+            add("    repeated in the live window: none")
+        browsers = data.get("browsers") or []
+        if browsers:
+            bits = "   ".join(f"{b.get('name')} {b.get('n')}" for b in browsers)
+            add(f"    browsers  {bits}")
+        prefixes = data.get("prefixes") or []
+        if prefixes:
+            bits = "   ".join(f"{p.get('prefix')} {p.get('n')}" for p in prefixes)
+            add(f"    prefixes  {bits}")
+        hours = data.get("hours") or []
+        hot = [
+            h for h in hours
+            if h.get("hits", 0) >= 100 and h.get("ips", 0) >= h.get("hits", 1) * 0.85
+        ]
+        if hot:
+            add(f"    bot-shaped hours, last 24h ({data.get('tz', '')}):")
+            for h in hot:
+                add(f"      {h.get('label')}  {h.get('hits')} hits  {h.get('ips')} ips")
+        elif hours:
+            last = hours[-1]
+            add(
+                f"    last hour {last.get('label')} ({data.get('tz', '')}):"
+                f"  {last.get('hits')} hits  {last.get('ips')} ips"
+            )
     add()
 
 if "mail" in want:

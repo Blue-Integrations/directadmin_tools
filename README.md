@@ -5,7 +5,7 @@ Root-only commands for this DirectAdmin host. Outbound mail uses msmtp. See [Mai
 | Command | What it does |
 | --- | --- |
 | `da-hits` | Monthly web-hit digest from Webalizer (AWStats if that data is present) |
-| `da-load` | Load, hot files, today's access logs, mail logs, OpenLiteSpeed |
+| `da-load` | Load, hot files, today's access logs, mail logs, OpenLiteSpeed, shop guest check |
 
 ## Mail (msmtprc)
 
@@ -102,12 +102,13 @@ da-load load
 da-load hits -d example.com
 da-load topbyip
 da-load topbyip -d example.com -n 20
+da-load guests -d example.com
 da-load mail
 da-load lsws
 da-load -e ops@example.com
 ```
 
-Sections: `load`, `hits`, `mail`, `lsws`, `topbyip`. `lightspeed` and `ols` are aliases for `lsws`. `topbyip` is opt-in and is left out of a plain `da-load` run.
+Sections: `load`, `hits`, `mail`, `lsws`, `guests`, `topbyip`. `lightspeed` and `ols` are aliases for `lsws`. `topbyip` is opt-in and is left out of a plain `da-load` run. `guests` is included in a plain `da-load` run, and only prints domains whose app has a presence table.
 
 | Section | Source |
 | --- | --- |
@@ -115,13 +116,14 @@ Sections: `load`, `hits`, `mail`, `lsws`, `topbyip`. `lightspeed` and `ols` are 
 | `hits` | Webalizer month-to-date URL table, plus today's vhost access logs in `/var/log/httpd/domains/*.log` |
 | `mail` | Exim queue, `/var/log/exim/mainlog`, `/var/log/exim/paniclog`, `/var/log/mail.log` |
 | `lsws` | `lshttpd` processes, `lswsctrl status`, `/var/log/openlitespeed/error_log` |
-| `topbyip` | Client IP counts from each `/var/log/httpd/domains/*.log`. Every IP is listed unless `-n` caps the list |
+| `topbyip` | Client IP counts from each `/var/log/httpd/domains/*.log`. Every IP is listed unless `-n` caps the list. Each listed IP gets a reverse lookup; a PTR name is printed beside it when one exists |
+| `guests` | Shop "who is online" check for one domain's app. Counts sessions from the last 10 minutes that already passed the bot filter, then says whether those hits are one address opening one product or the same product over and over. |
 
 A site is flagged when month-to-date hits are at least 100,000 and at least triple the previous month. A single URL is flagged at 100,000 hits. `mailer.php` and `send-mail.php` are called out even when they sit below the top of the table.
 
 | Option | Meaning |
 | --- | --- |
-| `-d`, `--domain DOMAIN` | Limit the hits section, today's access logs, and `topbyip` |
+| `-d`, `--domain DOMAIN` | Limit the hits section, today's access logs, `topbyip`, and `guests` |
 | `-n`, `--lines N` | Sample depth, 1–200 (default 12). For `topbyip`, how many IPs to list per domain |
 | `-t`, `--threshold N` | Hit count that raises an alert (default 100000) |
 | `-e`, `--email ADDR` | Email the report. Repeatable, or comma-separated |
