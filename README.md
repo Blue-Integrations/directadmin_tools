@@ -131,7 +131,3 @@ A site is flagged when month-to-date hits are at least 100,000 and at least trip
 | `-q`, `--quiet` | No stdout |
 
 `lswsctrl status` can report "not running" while workers are up, because it looks for a pid file. The process list in the report is the check to trust. The server-wide OpenLiteSpeed access log is usually empty; per-domain hits are in `/var/log/httpd/domains/`.
-
-```bash
-/root/bin/da-load-mail
-```
